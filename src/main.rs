@@ -1,22 +1,24 @@
-use std::io::prelude::*;
-use std::thread;
-use std::os::unix::net::{UnixStream, UnixListener};
-use std::io::BufReader;
-use std::sync::Arc;
-use std::fs;
 use std::env::var;
+use std::fs;
+use std::io::prelude::*;
+use std::io::BufReader;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
+use std::sync::Arc;
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use adblock::engine::Engine;
-use adblock::lists::{FilterFormat, FilterSet};
+use adblock::lists::FilterSet;
+use adblock::lists::ParseOptions;
+use adblock::request::Request;
+use adblock::Engine;
 
 use attohttpc;
 
 enum InitType {
     Default,
     Reload,
-    Update
+    Update,
 }
 
 /// Handles communication with clients connecting to the server.
@@ -37,23 +39,36 @@ fn handle_client(mut stream: UnixStream, mut blocker: Arc<Engine>) {
                 let source = parts.next().unwrap();
                 let req_type = parts.next().unwrap();
 
-                let result = blocker.check_network_urls(req_url, source, req_type);
+                let req = Request::new(&req_url, &source, &req_type).unwrap();
+
+                let result = blocker.check_network_request(&req);
 
                 if result.matched == true {
                     res.push('1');
                 } else {
                     res.push('0');
                 }
-            },
+            }
             "c" => {
                 // cosmetic request
                 let url = parts.next().unwrap();
                 let resources = blocker.url_cosmetic_resources(url);
-                let ids : Vec<String> = parts.next().unwrap().split('\t').map(|x| x.to_string()).collect();
-                let classes : Vec<String> = parts.next().unwrap().split('\t').map(|x| x.to_string()).collect();
+                let ids: Vec<String> = parts
+                    .next()
+                    .unwrap()
+                    .split('\t')
+                    .map(|x| x.to_string())
+                    .collect();
+                let classes: Vec<String> = parts
+                    .next()
+                    .unwrap()
+                    .split('\t')
+                    .map(|x| x.to_string())
+                    .collect();
 
-                let mut selectors = blocker.hidden_class_id_selectors(&classes, &ids, &resources.exceptions);
-                let mut hides : Vec<String> = resources.hide_selectors.into_iter().collect();
+                let mut selectors =
+                    blocker.hidden_class_id_selectors(&classes, &ids, &resources.exceptions);
+                let mut hides: Vec<String> = resources.hide_selectors.into_iter().collect();
                 selectors.append(&mut hides);
                 let mut style = selectors.join(", ");
 
@@ -63,17 +78,17 @@ fn handle_client(mut stream: UnixStream, mut blocker: Arc<Engine>) {
                 style.push('\n');
 
                 res.push_str(&style);
-            },
+            }
             "r" => {
                 // reload engine request
                 blocker = Arc::new(setup_blocker(InitType::Reload));
                 res.push('0');
-            },
+            }
             "u" => {
                 // force update request
                 blocker = Arc::new(setup_blocker(InitType::Update));
                 res.push('0');
-            },
+            }
             _ => {
                 res.push_str("Unknown code supplied");
             }
@@ -84,7 +99,7 @@ fn handle_client(mut stream: UnixStream, mut blocker: Arc<Engine>) {
 }
 
 /// Updates the specified filter list, returns the URL with the expiration timestamp.
-/// 
+///
 /// The timestamp won't be appended if the filter list doesn't contain the `Expired` field.
 ///
 /// * `url` - URL of the filter list that should be updated.
@@ -108,7 +123,8 @@ fn update_list(url: &str, lists_dir: &str) -> String {
         let line = line.unwrap();
         if line.contains("! Expires: ") {
             let days = line.split(' ').nth(2).unwrap().parse::<u64>().unwrap() * 24 * 3600;
-            let stamp = std::time::Duration::new(days, 0) + SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+            let stamp = std::time::Duration::new(days, 0)
+                + SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
 
             return url.to_string() + " " + &stamp.as_secs().to_string();
         }
@@ -118,7 +134,7 @@ fn update_list(url: &str, lists_dir: &str) -> String {
 }
 
 /// Parses the URL file and returns a boolean stating if the configuration was updated.
-/// 
+///
 /// Process every URL in the `urls_file`. If the file doesn't exist, it will be created.
 ///
 /// * `urls_file` - Path of the URL file.
@@ -137,7 +153,9 @@ fn parse_urls(urls_file: &str, lists_dir: &str, force_update: bool) -> bool {
             .open(&urls_file)
             .unwrap();
         let reader = BufReader::new(file.try_clone().unwrap());
-        let timestamp = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap();
+        let timestamp = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap();
         let mut out = String::new();
 
         for line in reader.lines() {
@@ -145,7 +163,11 @@ fn parse_urls(urls_file: &str, lists_dir: &str, force_update: bool) -> bool {
             let mut parts = line.split(' ');
             let url = parts.next().unwrap();
 
-            if !line.starts_with('#') && (force_update || parts.clone().count() == 0 || parts.next().unwrap().parse::<u64>().unwrap() < timestamp.as_secs()) {
+            if !line.starts_with('#')
+                && (force_update
+                    || parts.clone().count() == 0
+                    || parts.next().unwrap().parse::<u64>().unwrap() < timestamp.as_secs())
+            {
                 // list needs to be updated
                 updated = true;
                 out.push_str(&update_list(&url, &lists_dir));
@@ -167,7 +189,7 @@ fn parse_urls(urls_file: &str, lists_dir: &str, force_update: bool) -> bool {
 }
 
 /// Initializes the blocking engine from the adblock-rust crate, returns the initialized engine.
-/// 
+///
 /// If the engine configuration wasn't updated the engine data will be loaded from the serialized
 /// engine file, if it exists. If not, the files located in `lists_dir` will be processed as filter
 /// lists.
@@ -200,10 +222,10 @@ fn init_engine(engine_file: &str, lists_dir: &str, updated: bool) -> Engine {
         }
 
         let mut filter_set = FilterSet::new(false);
-        filter_set.add_filter_list(&rules, FilterFormat::Standard);
+        filter_set.add_filter_list(&rules, ParseOptions::default());
         let blocker = Engine::from_filter_set(filter_set, true);
 
-        let data = blocker.serialize();
+        let data = blocker.serialize_raw();
         if data.is_ok() {
             let _ = fs::write(engine_file, data.unwrap());
         }
@@ -212,8 +234,8 @@ fn init_engine(engine_file: &str, lists_dir: &str, updated: bool) -> Engine {
     }
 }
 
-/// Starts handling incoming client connections. 
-/// 
+/// Starts handling incoming client connections.
+///
 /// The socket file will get automatically removed if it already exists.
 ///
 /// * `socket_path` - Path of the socket file used for communication.
@@ -242,7 +264,7 @@ fn start_server(socket_path: &str, blocker: Engine) {
 }
 
 /// Setup needed before initializing the server, returns the initialized Engine struct.
-/// 
+///
 /// Consists of finding the $HOME directory, parsing the url file with `parse_urls` based on
 /// specified `init_type` and creating the custom filters file if it doesn't exist.
 ///
@@ -256,19 +278,18 @@ fn setup_blocker(init_type: InitType) -> Engine {
     let custom_filters_file = lists_dir.to_owned() + "/custom";
 
     let updated = match init_type {
-        InitType::Default => {
-            parse_urls(&urls_file, &lists_dir, false)
-        },
+        InitType::Default => parse_urls(&urls_file, &lists_dir, false),
         InitType::Reload => {
             parse_urls(&urls_file, &lists_dir, false);
             true
-        },
-        InitType::Update => {
-            parse_urls(&urls_file, &lists_dir, true)
         }
+        InitType::Update => parse_urls(&urls_file, &lists_dir, true),
     };
 
-    let custom_file = fs::OpenOptions::new().write(true).create_new(true).open(&custom_filters_file);
+    let custom_file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&custom_filters_file);
     match custom_file {
         Ok(mut file) => {
             file.write(b"# Add your custom network and cosmetic filters here, lines starting with # will be ignored\n").unwrap();
